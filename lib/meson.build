@@ -2,14 +2,14 @@ pkgconfig = import('pkgconfig')
 
 sources = files(
   'vkvideodecodeparser.cpp',
-  'gstvkh264dec.cpp',
-  'gstvkh265dec.cpp',
+  'gstvkh264parse.cpp',
+  #'gstvkh265dec.cpp',
   'gstvkvideoparser.cpp',
   'videoutils.c',
-  'codecs/gsth264decoder.c',
-  'codecs/gsth264picture.c',
-  'codecs/gsth265decoder.c',
-  'codecs/gsth265picture.c',
+  #'codecs/gsth264decoder.c',
+  #'codecs/gsth264picture.c',
+  #'codecs/gsth265decoder.c',
+  #'codecs/gsth265picture.c',
 )
 
 videoparser_headers = files(

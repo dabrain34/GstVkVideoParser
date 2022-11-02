@@ -1,0 +1,971 @@
+/* VideoParser
+ * Copyright (C) 2022 Igalia, S.L.
+ *     Author: Víctor Jáquez <vjaquez@igalia.com>
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you
+ * may not use this file except in compliance with the License.  You
+ * may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied.  See the License for the specific language governing
+ * permissions and limitations under the License.
+ */
+
+#include "gstvkh264parse.h"
+#include "glib_compat.h"
+
+#include "videoutils.h"
+
+
+GST_DEBUG_CATEGORY_EXTERN(gst_vk_video_parser_debug);
+#define GST_CAT_DEFAULT gst_vk_video_parser_debug
+
+
+// typedef struct _GstVkH264Dec GstVkH264Dec;
+// struct _GstVkH264Dec
+// {
+//   GstH264Decoder parent;
+//   VkParserVideoDecodeClient *client;
+//   gboolean oob_pic_params;
+
+//   gint max_dpb_size;
+
+//   GstH264SPS last_sps;
+//   GstH264PPS last_pps;
+//   VkH264Picture vkp;
+//   GArray *refs;
+
+//   VkSharedBaseObj<VkParserVideoRefCountBase> spsclient, ppsclient;
+
+//   guint32 sps_update_count;
+//   guint32 pps_update_count;
+// };
+
+struct VkPic {
+    VkPicIf* pic;
+    VkParserPictureData data;
+    GByteArray* bitstream;
+    VkH264Picture vkp;
+    uint8_t* slice_group_map;
+    GArray* slice_offsets;
+};
+
+enum {
+    PROP_USER_DATA = 1,
+    PROP_OOB_PIC_PARAMS,
+};
+
+static VkPic* vk_pic_new(VkPicIf* pic)
+{
+    VkPic* vkpic = g_new0(struct VkPic, 1);
+    uint32_t zero = 0;
+
+    vkpic->pic = pic;
+    vkpic->bitstream = g_byte_array_new();
+    vkpic->slice_offsets = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    g_array_append_val(vkpic->slice_offsets, zero);
+    return vkpic;
+}
+
+static void
+vk_pic_free(gpointer data)
+{
+    VkPic* vkpic = static_cast<VkPic*>(data);
+
+    vkpic->pic->Release();
+    g_byte_array_unref(vkpic->bitstream);
+    g_array_unref(vkpic->slice_offsets);
+    g_free(vkpic->slice_group_map);
+    g_free(vkpic);
+}
+
+static bool
+profile_is_svc(GstCaps* caps)
+{
+    const GstStructure* structure = gst_caps_get_structure(caps, 0);
+    const gchar* profile = gst_structure_get_string(structure, "profile");
+
+    return g_str_has_prefix(profile, "scalable");
+}
+
+// static GstFlowReturn
+// gst_vk_h264_dec_new_sequence (GstH264Decoder * decoder, const GstH264SPS * sps,
+//     gint max_dpb_size)
+// {
+//   GstVkH264Dec *self = GST_VK_H264_DEC (decoder);
+//   GstVideoDecoder *dec = GST_VIDEO_DECODER (decoder);
+//   GstVideoCodecState *state;
+//   VkParserSequenceInfo seqInfo;
+//   guint dar_n = 0, dar_d = 0;
+
+//   seqInfo = VkParserSequenceInfo {
+//     .eCodec = VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_EXT,
+//     .isSVC = profile_is_svc(decoder->input_state->caps),
+//     .frameRate = pack_framerate(GST_VIDEO_INFO_FPS_N(&decoder->input_state->info), GST_VIDEO_INFO_FPS_D(&decoder->input_state->info)),
+//     .bProgSeq = sps->frame_mbs_only_flag,
+//     .nCodedWidth = sps->width,
+//     .nCodedHeight = sps->height,
+//     .nMaxWidth = 0,
+//     .nMaxHeight = 0,
+//     .nChromaFormat = sps->chroma_format_idc, // Chroma Format (0=4:0:0, 1=4:2:0, 2=4:2:2, 3=4:4:4)
+//     .uBitDepthLumaMinus8 = sps->bit_depth_luma_minus8, // Luma bit depth (0=8bit)
+//     .uBitDepthChromaMinus8 = sps->bit_depth_chroma_minus8, // Chroma bit depth (0=8bit)
+//     .cbSequenceHeader = 0, // Number of bytes in SequenceHeaderData
+//     .nMinNumDecodeSurfaces = max_dpb_size + 1,
+//     // .SequenceHeaderData[1024];
+//     .pbSideData = nullptr,
+//     .cbSideData = 0,
+//     .codecProfile = sps->profile_idc,
+//   };
+
+//   if (sps->frame_cropping_flag) {
+//     seqInfo.nDisplayWidth = sps->crop_rect_width;
+//     seqInfo.nDisplayHeight = sps->crop_rect_height;
+//   } else {
+//     seqInfo.nDisplayWidth = sps->width;
+//     seqInfo.nDisplayHeight = sps->height;
+//   }
+
+//   if (sps->vui_parameters_present_flag) {
+//     seqInfo.uVideoFullRange = sps->vui_parameters.video_full_range_flag;        // 0=16-235, 1=0-255
+//     if (sps->vui_parameters.nal_hrd_parameters_present_flag)
+//       seqInfo.lBitrate = sps->vui_parameters.nal_hrd_parameters.bit_rate_scale;
+//     else if (sps->vui_parameters.vcl_hrd_parameters_present_flag)
+//       seqInfo.lBitrate = sps->vui_parameters.vcl_hrd_parameters.bit_rate_scale;
+//     seqInfo.lVideoFormat = sps->vui_parameters.video_format;    // Video Format (VideoFormatXXX)
+//     seqInfo.lColorPrimaries = sps->vui_parameters.colour_primaries;     // Colour Primaries (ColorPrimariesXXX)
+//     seqInfo.lTransferCharacteristics =
+//         sps->vui_parameters.transfer_characteristics;
+//     seqInfo.lMatrixCoefficients = sps->vui_parameters.matrix_coefficients;
+//   }
+
+//   if (gst_video_calculate_display_ratio (&dar_n, &dar_d,
+//           seqInfo.nDisplayWidth, seqInfo.nDisplayHeight,
+//           GST_VIDEO_INFO_PAR_N (&decoder->input_state->info),
+//           GST_VIDEO_INFO_PAR_D (&decoder->input_state->info), 1, 1)) {
+//     seqInfo.lDARWidth = dar_n;
+//     seqInfo.lDARHeight = dar_d;
+//   }
+
+//   if (self->client)
+//     self->max_dpb_size = self->client->BeginSequence (&seqInfo);
+
+//   state =
+//       gst_video_decoder_set_output_state (dec, GST_VIDEO_FORMAT_NV12,
+//       seqInfo.nDisplayWidth, seqInfo.nDisplayHeight, decoder->input_state);
+//   gst_video_codec_state_unref (state);
+
+//   gst_video_decoder_negotiate (dec);
+
+//   return GST_FLOW_OK;
+// }
+
+// static GstFlowReturn
+// gst_vk_h264_dec_decode_slice (GstH264Decoder * decoder, GstH264Picture * picture,
+//     GstH264Slice * slice, GArray * ref_pic_list0, GArray * ref_pic_list1)
+// {
+//   VkPic *vkpic = static_cast<VkPic *>(gst_h264_picture_get_user_data(picture));
+//   static const uint8_t nal[] = { 0, 0, 1 };
+//   uint32_t offset;
+
+//   vkpic->data.nNumSlices++;
+//   // nvidia parser adds 000001 NAL unit identifier at every slice
+//   g_byte_array_append (vkpic->bitstream, nal, sizeof (nal));
+//   g_byte_array_append (vkpic->bitstream, slice->nalu.data + slice->nalu.offset,
+//       slice->nalu.size);
+//   // GST_MEMDUMP_OBJECT(decoder, "SLICE :", slice->nalu.data + slice->nalu.offset, slice->nalu.size);
+//   offset =
+//       g_array_index (vkpic->slice_offsets, uint32_t,
+//       vkpic->slice_offsets->len - 1) + slice->nalu.size + sizeof (nal);
+//   g_array_append_val (vkpic->slice_offsets, offset);
+
+//   return GST_FLOW_OK;
+// }
+
+// static GstFlowReturn
+// gst_vk_h264_dec_new_picture (GstH264Decoder * decoder, GstVideoCodecFrame * frame,
+//     GstH264Picture * picture)
+// {
+//   GstVkH264Dec *self = GST_VK_H264_DEC (decoder);
+//   VkPicIf *pic = nullptr;
+//   VkPic *vkpic;
+
+//   if (self->client) {
+//     if (!self->client->AllocPictureBuffer (&pic))
+//       return GST_FLOW_ERROR;
+//   }
+
+//   vkpic = vk_pic_new (pic);
+//   gst_h264_picture_set_user_data (picture, vkpic, vk_pic_free);
+
+//   frame->output_buffer = gst_buffer_new ();
+
+//   return GST_FLOW_OK;
+// }
+
+// static GstFlowReturn
+// gst_vk_h264_dec_new_field_picture (GstH264Decoder * decoder,
+//     GstH264Picture * first_field, GstH264Picture * second_field)
+// {
+//   GstVkH264Dec *self = GST_VK_H264_DEC (decoder);
+//   VkPicIf *pic = nullptr;
+//   VkPic *vkpic;
+
+//   if (self->client) {
+//     if (!self->client->AllocPictureBuffer (&pic))
+//       return GST_FLOW_ERROR;
+//   }
+
+//   vkpic = vk_pic_new (pic);
+//   gst_h264_picture_set_user_data (second_field, vkpic, vk_pic_free);
+
+//   return GST_FLOW_OK;
+// }
+
+// static GstFlowReturn
+// gst_vk_h264_dec_output_picture (GstH264Decoder * decoder,
+//     GstVideoCodecFrame * frame, GstH264Picture * picture)
+// {
+//   GstVkH264Dec *self = GST_VK_H264_DEC (decoder);
+//   VkPic *vkpic = reinterpret_cast<VkPic *>(gst_h264_picture_get_user_data(picture));;
+
+//   if (self->client) {
+//     if (!self->client->DisplayPicture (vkpic->pic,
+//             picture->system_frame_number * frame->duration / 100)) {
+//       gst_h264_picture_unref (picture);
+//       return GST_FLOW_ERROR;
+//     }
+//   }
+
+//   gst_h264_picture_unref (picture);
+//   return gst_video_decoder_finish_frame (GST_VIDEO_DECODER (decoder), frame);
+// }
+
+// static GstFlowReturn
+// gst_vk_h264_dec_end_picture (GstH264Decoder * decoder, GstH264Picture * picture)
+// {
+//   GstVkH264Dec *self = GST_VK_H264_DEC (decoder);
+//   VkPic *vkpic = reinterpret_cast<VkPic *>(gst_h264_picture_get_user_data(picture));
+//   gsize len;
+//   uint32_t *slice_offsets;
+//   GstFlowReturn ret = GST_FLOW_OK;
+
+//   vkpic->data.pBitstreamData = g_byte_array_steal (vkpic->bitstream, &len);
+//   vkpic->data.nBitstreamDataLen = static_cast<int32_t>(len);
+//   vkpic->data.pSliceDataOffsets = slice_offsets =
+//       static_cast <uint32_t *>(g_array_steal (vkpic->slice_offsets, NULL));
+
+//   if (self->client) {
+//     if (!self->client->DecodePicture (&vkpic->data))
+//       ret = GST_FLOW_ERROR;
+//   }
+
+//   g_free (vkpic->data.pBitstreamData);
+//   g_free (slice_offsets);
+
+//   return ret;
+// }
+
+// static uint8_t *
+// get_slice_group_map (GstH264PPS * pps)
+// {
+//   uint8_t *ret, i, j, k;
+
+//   ret = g_new0 (uint8_t, pps->pic_size_in_map_units_minus1 + 1);
+
+//   if (pps->num_slice_groups_minus1 == 0)
+//     return ret;
+
+//   switch (pps->slice_group_map_type) {
+//     case 0:{
+//       i = 0;
+//       do {
+//         for (j = 0;
+//             j <= pps->num_slice_groups_minus1
+//             && i <= pps->pic_size_in_map_units_minus1;
+//             i += pps->run_length_minus1[j++] + 1) {
+//           for (k = 0; k <= pps->run_length_minus1[j]
+//               && i + k <= pps->pic_size_in_map_units_minus1; k++)
+//             ret[i + k] = j;
+//         }
+//       } while (i <= pps->pic_size_in_map_units_minus1);
+//       break;
+//     }
+//     case 1:{
+//       for (i = 0; i <= pps->pic_size_in_map_units_minus1; i++) {
+//         ret[i] = ((i % (pps->sequence->pic_width_in_mbs_minus1 + 1)) +
+//             (((i / (pps->sequence->pic_width_in_mbs_minus1 + 1)) *
+//                     (pps->num_slice_groups_minus1 + 1)) / 2)) %
+//             (pps->num_slice_groups_minus1 + 1);
+//       }
+//       break;
+//     }
+//     case 2:{
+//       uint32_t ytl, xtl, ybr, xbr;
+
+//       for (i = 0; i <= pps->pic_size_in_map_units_minus1; i++)
+//         ret[i] = pps->num_slice_groups_minus1;
+//       for (i = pps->num_slice_groups_minus1 - 1; i >= 0; i--) {
+//         ytl = pps->top_left[i] / (pps->sequence->pic_width_in_mbs_minus1 + 1);
+//         xtl = pps->top_left[i] % (pps->sequence->pic_width_in_mbs_minus1 + 1);
+//         ybr =
+//             pps->bottom_right[i] / (pps->sequence->pic_width_in_mbs_minus1 + 1);
+//         xbr =
+//             pps->bottom_right[i] % (pps->sequence->pic_width_in_mbs_minus1 + 1);
+
+//         for (j = ytl; j < ybr; j++)
+//           for (k = xtl; k < xbr; k++)
+//             ret[j * (pps->sequence->pic_width_in_mbs_minus1 + 1) + k] = i;
+//       }
+//       break;
+//     }
+//     case 3:
+//     case 4:
+//     case 5:
+//       /* @TODO */
+//       break;
+//     case 6:
+//       for (i = 0; i <= pps->pic_size_in_map_units_minus1; i++)
+//         ret[i] = pps->slice_group_id[i];
+//       break;
+//     default:
+//       break;
+//   };
+
+//   return ret;
+// }
+
+static void
+fill_sps (GstH264SPS * sps, VkH264Picture * vkp)
+{
+  GstH264VUIParams *vui = &sps->vui_parameters;
+  GstH264HRDParams *hrd = NULL;
+
+  if (sps->scaling_matrix_present_flag) {
+    vkp->scaling_lists_sps.scaling_list_present_mask = 1;
+    vkp->scaling_lists_sps.use_default_scaling_matrix_mask = 0;
+
+    memcpy (&vkp->scaling_lists_sps.ScalingList4x4, &sps->scaling_lists_4x4,
+        sizeof (vkp->scaling_lists_sps.ScalingList4x4));
+    memcpy (&vkp->scaling_lists_sps.ScalingList8x8, &sps->scaling_lists_8x8,
+        sizeof (vkp->scaling_lists_sps.ScalingList8x8));
+  }
+
+  if (sps->num_ref_frames_in_pic_order_cnt_cycle > 0) {
+    for (uint32_t i = 0; i < sps->num_ref_frames_in_pic_order_cnt_cycle; i++)
+      vkp->offset_for_ref_frame[i] = sps->offset_for_ref_frame[i];
+  }
+
+  if (vui->nal_hrd_parameters_present_flag)
+    hrd = &vui->nal_hrd_parameters;
+  else if (vui->vcl_hrd_parameters_present_flag)
+    hrd = &vui->vcl_hrd_parameters;
+
+  if (hrd) {
+    vkp->hrd = StdVideoH264HrdParameters {
+      .cpb_cnt_minus1 = hrd->cpb_cnt_minus1,
+      .bit_rate_scale = hrd->bit_rate_scale,
+      .cpb_size_scale = hrd->cpb_size_scale,
+      .initial_cpb_removal_delay_length_minus1 =
+          hrd->initial_cpb_removal_delay_length_minus1,
+      .cpb_removal_delay_length_minus1 = hrd->cpb_removal_delay_length_minus1,
+      .dpb_output_delay_length_minus1 = hrd->dpb_output_delay_length_minus1,
+      .time_offset_length = hrd->time_offset_length,
+    };
+
+    memcpy (&vkp->hrd.bit_rate_value_minus1, hrd->bit_rate_value_minus1,
+        sizeof (vkp->hrd.bit_rate_value_minus1));
+    memcpy (&vkp->hrd.cpb_size_value_minus1, hrd->cpb_size_value_minus1,
+        sizeof (vkp->hrd.cpb_size_value_minus1));
+  }
+
+  vkp->vui = StdVideoH264SequenceParameterSetVui {
+    .flags = {
+      .aspect_ratio_info_present_flag = vui->aspect_ratio_info_present_flag,
+      .overscan_info_present_flag = vui->overscan_info_present_flag,
+      .overscan_appropriate_flag = vui->overscan_appropriate_flag,
+      .video_signal_type_present_flag = vui->video_signal_type_present_flag,
+      .video_full_range_flag = vui->video_full_range_flag,
+      .color_description_present_flag = vui->colour_description_present_flag,
+      .chroma_loc_info_present_flag = vui->chroma_loc_info_present_flag,
+      .timing_info_present_flag = vui->timing_info_present_flag,
+      .fixed_frame_rate_flag = vui->fixed_frame_rate_flag,
+      .bitstream_restriction_flag = vui->bitstream_restriction_flag,
+      .nal_hrd_parameters_present_flag = vui->nal_hrd_parameters_present_flag,
+      .vcl_hrd_parameters_present_flag = vui->vcl_hrd_parameters_present_flag,
+    },
+    .aspect_ratio_idc =
+        static_cast<StdVideoH264AspectRatioIdc>(vui->aspect_ratio_idc),
+    .sar_width = vui->sar_width,
+    .sar_height = vui->sar_height,
+    .video_format = vui->video_format,
+    .colour_primaries = vui->colour_primaries,
+    .transfer_characteristics = vui->transfer_characteristics,
+    .matrix_coefficients = vui->matrix_coefficients,
+    .num_units_in_tick = vui->num_units_in_tick,
+    .time_scale = vui->time_scale,
+    .max_num_reorder_frames = static_cast<uint8_t>(vui->num_reorder_frames),
+    .max_dec_frame_buffering =
+        static_cast<uint8_t>(vui->max_dec_frame_buffering),
+    .chroma_sample_loc_type_top_field = vui->chroma_sample_loc_type_top_field,
+    .chroma_sample_loc_type_bottom_field = vui->chroma_sample_loc_type_bottom_field,
+    .pHrdParameters = hrd ? &vkp->hrd : NULL,
+  };
+
+  vkp->sps = StdVideoH264SequenceParameterSet {
+    .flags = {
+      .constraint_set0_flag = sps->constraint_set0_flag,
+      .constraint_set1_flag = sps->constraint_set1_flag,
+      .constraint_set2_flag = sps->constraint_set2_flag,
+      .constraint_set3_flag = sps->constraint_set3_flag,
+      .constraint_set4_flag = sps->constraint_set4_flag,
+      .constraint_set5_flag = sps->constraint_set5_flag,
+      .direct_8x8_inference_flag = sps->direct_8x8_inference_flag,
+      .mb_adaptive_frame_field_flag = sps->mb_adaptive_frame_field_flag,
+      .frame_mbs_only_flag = sps->frame_mbs_only_flag,
+      .delta_pic_order_always_zero_flag = sps->delta_pic_order_always_zero_flag,
+      .separate_colour_plane_flag = sps->separate_colour_plane_flag,
+      .gaps_in_frame_num_value_allowed_flag =
+          sps->gaps_in_frame_num_value_allowed_flag,
+      .qpprime_y_zero_transform_bypass_flag =
+          sps->qpprime_y_zero_transform_bypass_flag,
+      .frame_cropping_flag = sps->frame_cropping_flag,
+      .seq_scaling_matrix_present_flag = sps->scaling_matrix_present_flag,
+      .vui_parameters_present_flag = sps->vui_parameters_present_flag,
+    },
+    .profile_idc = static_cast<StdVideoH264ProfileIdc>(sps->profile_idc),
+    .level_idc = static_cast<StdVideoH264LevelIdc>(sps->level_idc),
+    .chroma_format_idc =
+        static_cast<StdVideoH264ChromaFormatIdc>(sps->chroma_format_idc),
+    .seq_parameter_set_id = static_cast<uint8_t>(sps->id),
+    .bit_depth_luma_minus8 = sps->bit_depth_luma_minus8,
+    .bit_depth_chroma_minus8 = sps->bit_depth_chroma_minus8,
+    .log2_max_frame_num_minus4 = sps->log2_max_frame_num_minus4,
+    .pic_order_cnt_type =
+        static_cast<StdVideoH264PocType>(sps->pic_order_cnt_type),
+    .offset_for_non_ref_pic = sps->offset_for_non_ref_pic,
+    .offset_for_top_to_bottom_field = sps->offset_for_top_to_bottom_field,
+    .log2_max_pic_order_cnt_lsb_minus4 = sps->log2_max_pic_order_cnt_lsb_minus4,
+    .num_ref_frames_in_pic_order_cnt_cycle =
+        sps->num_ref_frames_in_pic_order_cnt_cycle,
+    .max_num_ref_frames = static_cast<uint8_t>(sps->num_ref_frames),
+    .pic_width_in_mbs_minus1 = sps->pic_width_in_mbs_minus1,
+    .pic_height_in_map_units_minus1 = sps->pic_height_in_map_units_minus1,
+    .frame_crop_left_offset = sps->frame_crop_left_offset,
+    .frame_crop_right_offset = sps->frame_crop_right_offset,
+    .frame_crop_top_offset = sps->frame_crop_top_offset,
+    .frame_crop_bottom_offset = sps->frame_crop_bottom_offset,
+    .pOffsetForRefFrame = (sps->num_ref_frames_in_pic_order_cnt_cycle > 0) ?
+        vkp->offset_for_ref_frame : nullptr,
+    .pScalingLists = sps->scaling_matrix_present_flag ?
+        &vkp->scaling_lists_sps : nullptr,
+    .pSequenceParameterSetVui = sps->vui_parameters_present_flag ?
+        &vkp->vui : nullptr,
+  };
+}
+
+static void
+fill_pps (GstH264PPS * pps, VkH264Picture * vkp)
+{
+  if (pps->pic_scaling_matrix_present_flag) {
+    vkp->scaling_lists_pps.scaling_list_present_mask = 1;
+    vkp->scaling_lists_pps.use_default_scaling_matrix_mask = 0;
+
+    memcpy (&vkp->scaling_lists_pps.ScalingList4x4, &pps->scaling_lists_4x4,
+        sizeof (vkp->scaling_lists_pps.ScalingList4x4));
+    memcpy (&vkp->scaling_lists_pps.ScalingList8x8, &pps->scaling_lists_8x8,
+        sizeof (vkp->scaling_lists_pps.ScalingList8x8));
+  }
+
+  vkp->pps = StdVideoH264PictureParameterSet {
+    .flags = {
+      .transform_8x8_mode_flag = pps->transform_8x8_mode_flag,
+      .redundant_pic_cnt_present_flag = pps->redundant_pic_cnt_present_flag,
+      .constrained_intra_pred_flag = pps->constrained_intra_pred_flag,
+      .deblocking_filter_control_present_flag =
+          pps->deblocking_filter_control_present_flag,
+      .weighted_pred_flag = pps->weighted_pred_flag,
+      .bottom_field_pic_order_in_frame_present_flag = 0, //FIXME
+      .entropy_coding_mode_flag = pps->entropy_coding_mode_flag,
+      .pic_scaling_matrix_present_flag = pps->pic_scaling_matrix_present_flag,
+    },
+    .seq_parameter_set_id = static_cast<uint8_t>(pps->sequence->id),
+    .pic_parameter_set_id = static_cast<uint8_t>(pps->id),
+    .num_ref_idx_l0_default_active_minus1 = pps->num_ref_idx_l0_active_minus1,
+    .num_ref_idx_l1_default_active_minus1 = pps->num_ref_idx_l1_active_minus1,
+    .weighted_bipred_idc =
+        static_cast<StdVideoH264WeightedBipredIdc>(pps->weighted_bipred_idc),
+    .pic_init_qp_minus26 = pps->pic_init_qp_minus26,
+    .pic_init_qs_minus26 = pps->pic_init_qs_minus26,
+    .chroma_qp_index_offset = pps->chroma_qp_index_offset,
+    .second_chroma_qp_index_offset =
+        static_cast<int8_t>(pps->second_chroma_qp_index_offset),
+    .pScalingLists = pps->pic_scaling_matrix_present_flag ?
+        &vkp->scaling_lists_pps : NULL,
+  };
+}
+
+// static void
+// fill_dbp_entry (VkParserH264DpbEntry * entry, GstH264Picture * picture)
+// {
+//   auto vkpic =
+//       reinterpret_cast <VkPic *>(gst_h264_picture_get_user_data (picture));
+//   if (!vkpic) {
+//     *entry = { 0, };
+//     return;
+//   }
+
+//   *entry = VkParserH264DpbEntry {
+//     .pPicBuf = vkpic->pic,
+//     .FrameIdx = GST_H264_PICTURE_IS_LONG_TERM_REF (picture) ? picture->long_term_pic_num : picture->pic_num,
+//     .is_long_term = GST_H264_PICTURE_IS_LONG_TERM_REF (picture),
+//     .not_existing = picture->nonexisting,
+//   };
+
+//   // used_for_reference: 0=unused, 1=top_field, 2=bottom_field, 3=both_fields
+//   switch (picture->field) {
+//     case GST_H264_PICTURE_FIELD_FRAME:
+//       entry->used_for_reference = 3;
+//       entry->FieldOrderCnt[0] = picture->top_field_order_cnt;
+//       entry->FieldOrderCnt[1] = picture->bottom_field_order_cnt;
+//       break;
+//     case GST_H264_PICTURE_FIELD_BOTTOM_FIELD:
+//       if (picture->other_field) {
+//         entry->FieldOrderCnt[0] = picture->other_field->top_field_order_cnt;
+//         entry->used_for_reference = 3;
+//       } else {
+//         entry->FieldOrderCnt[0] = 0;
+//         entry->used_for_reference = 2;
+//       }
+//       entry->FieldOrderCnt[1] = picture->bottom_field_order_cnt;
+//       break;
+//     case GST_H264_PICTURE_FIELD_TOP_FIELD:
+//       entry->FieldOrderCnt[0] = picture->top_field_order_cnt;
+//       if (picture->other_field) {
+//         entry->FieldOrderCnt[1] = picture->other_field->bottom_field_order_cnt;
+//         entry->used_for_reference = 3;
+//       } else {
+//         entry->FieldOrderCnt[1] = 0;
+//         entry->used_for_reference = 2;
+//       }
+//       break;
+//     default:
+//       entry->used_for_reference = 0;
+//       break;
+//   }
+// }
+
+// static GstFlowReturn
+// gst_vk_h264_dec_start_picture (GstH264Decoder * decoder, GstH264Picture * picture,
+//     GstH264Slice * slice, GstH264Dpb * dpb)
+// {
+//   GstVkH264Dec *self = GST_VK_H264_DEC (decoder);
+//   VkPic *vkpic =
+//       reinterpret_cast <VkPic *>(gst_h264_picture_get_user_data (picture));
+//   VkH264Picture *vkp = &self->vkp;
+//   GstH264PPS *pps = slice->header.pps;
+//   GstH264SPS *sps = pps->sequence;
+
+//   if (!self->oob_pic_params
+//       || (self->sps_update_count == 0 && self->sps_update_count == 0)) {
+//     vkp = &vkpic->vkp;
+//     fill_sps (sps, vkp);
+//     fill_pps (pps, vkp);
+//   }
+
+//   vkpic->data = VkParserPictureData {
+//     .PicWidthInMbs = sps->width / 16, // Coded Frame Size
+//     .FrameHeightInMbs = sps->height / 16, // Coded Frame Height
+//     .pCurrPic = vkpic->pic,
+//     .field_pic_flag = slice->header.field_pic_flag, // 0=frame picture, 1=field picture
+//     .bottom_field_flag = slice->header.bottom_field_flag, // 0=top field, 1=bottom field (ignored if field_pic_flag=0)
+//     .second_field = picture->second_field, // Second field of a complementary field pair
+//     .progressive_frame = (picture->buffer_flags & GST_VIDEO_BUFFER_FLAG_INTERLACED) == 0, // Frame is progressive
+//     .top_field_first = (picture->buffer_flags & GST_VIDEO_BUFFER_FLAG_TFF) != 0,
+//     .repeat_first_field = 0, // For 3:2 pulldown (number of additional fields,
+//                              // 2=frame doubling, 4=frame tripling)
+//     .ref_pic_flag = picture->ref_pic, // Frame is a reference frame
+//     .intra_pic_flag =
+//         GST_H264_IS_I_SLICE (&slice->header)
+//         || GST_H264_IS_SI_SLICE (&slice->header), // Frame is entirely intra coded (no temporal dependencies)
+//     .chroma_format = sps->chroma_format_idc, // Chroma Format (should match sequence info)
+//     .picture_order_count = picture->pic_order_cnt, // picture order count (if known)
+
+//     .pbSideData = nullptr, // Encryption Info
+//     .nSideDataLen = 0, // Encryption Info length
+
+//     // Bitstream data
+//     //.nBitstreamDataLen, // Number of bytes in bitstream data buffer
+//     //.pBitstreamData, // Ptr to bitstream data for this picture (slice-layer)
+//     //.pSliceDataOffsets, // nNumSlices entries, contains offset of each slice
+//     // within the bitstream data buffer
+//   };
+
+//   VkParserH264PictureData *h264 = &vkpic->data.CodecSpecific.h264;
+//   *h264 = VkParserH264PictureData {
+//     .pStdSps = &vkp->sps,
+//     .pSpsClientObject = self->spsclient,
+//     .pStdPps = &vkp->pps,
+//     .pPpsClientObject = self->ppsclient,
+//     .pic_parameter_set_id = static_cast<uint8_t>(pps->id),          // PPS ID
+//     .seq_parameter_set_id = static_cast<uint8_t>(pps->sequence->id),          // SPS ID
+//     .num_ref_idx_l0_active_minus1 = pps->num_ref_idx_l0_active_minus1,
+//     .num_ref_idx_l1_active_minus1 = pps->num_ref_idx_l1_active_minus1,
+//     .weighted_pred_flag = pps->weighted_pred_flag,
+//     .weighted_bipred_idc = pps->weighted_bipred_idc,
+//     .pic_init_qp_minus26 = pps->pic_init_qp_minus26,
+//     .redundant_pic_cnt_present_flag = pps->redundant_pic_cnt_present_flag,
+//     .deblocking_filter_control_present_flag =
+//         pps->deblocking_filter_control_present_flag,
+//     .transform_8x8_mode_flag = pps->transform_8x8_mode_flag,
+//     .MbaffFrameFlag =
+//         (sps->mb_adaptive_frame_field_flag && !slice->header.field_pic_flag),
+//     .constrained_intra_pred_flag = pps->constrained_intra_pred_flag,
+//     .entropy_coding_mode_flag = pps->entropy_coding_mode_flag,
+//     .pic_order_present_flag = pps->pic_order_present_flag,
+//     .chroma_qp_index_offset = pps->chroma_qp_index_offset,
+//     .second_chroma_qp_index_offset =
+//         static_cast<int8_t>(pps->second_chroma_qp_index_offset),
+//     .frame_num = picture->frame_num,
+//     .CurrFieldOrderCnt =
+//         { picture->top_field_order_cnt, picture->bottom_field_order_cnt },
+//     .fmo_aso_enable = pps->num_slice_groups_minus1 > 0,
+//     .num_slice_groups_minus1 =
+//         static_cast<uint8_t>(pps->num_slice_groups_minus1),
+//     .slice_group_map_type = pps->slice_group_map_type,
+//     .pic_init_qs_minus26 = pps->pic_init_qp_minus26,
+//     .slice_group_change_rate_minus1 = pps->slice_group_change_rate_minus1,
+//     .pMb2SliceGroupMap =
+//         (vkpic->slice_group_map = get_slice_group_map (pps),
+//          vkpic->slice_group_map),
+//     // // DPB
+//     // VkParserH264DpbEntry dpb[16 + 1]; // List of reference frames within the DPB
+//   };
+
+//   /* reference frames */
+//   {
+//     guint i, ref_frame_idx = 0;
+
+//     gst_h264_dpb_get_pictures_short_term_ref (dpb, FALSE, FALSE, self->refs);
+//     for (i = 0; ref_frame_idx < 16 + 1 && i < self->refs->len; i++) {
+//       GstH264Picture *pic = g_array_index (self->refs, GstH264Picture *, i);
+//       fill_dbp_entry (&h264->dpb[ref_frame_idx++], pic);
+//     }
+//     g_array_set_size (self->refs, 0);
+
+//     gst_h264_dpb_get_pictures_long_term_ref (dpb, FALSE, self->refs);
+//     for (; ref_frame_idx < 16 + 1 && i < self->refs->len; i++) {
+//       GstH264Picture *pic = g_array_index (self->refs, GstH264Picture *, i);
+//       fill_dbp_entry (&h264->dpb[ref_frame_idx++], pic);
+//     }
+//     g_array_set_size (self->refs, 0);
+
+//     for (; ref_frame_idx < 16 + 1; ref_frame_idx++)
+//       h264->dpb[ref_frame_idx] = { 0, };
+//   }
+
+//   return GST_FLOW_OK;
+// }
+
+// static void
+// gst_vk_h264_dec_unhandled_nalu (GstH264Decoder * decoder, const guint8 * data,
+//     guint32 size)
+// {
+//   GstVkH264Dec *self = GST_VK_H264_DEC (decoder);
+
+//   if (self->client)
+//     self->client->UnhandledNALU (data, size);
+// }
+
+// static bool
+// sps_cmp (GstH264SPS * a, GstH264SPS * b)
+// {
+// #define CMP_FIELD(x) G_STMT_START { if (a->x != b->x) return false; } G_STMT_END
+//   CMP_FIELD (id);
+
+//   CMP_FIELD (profile_idc);
+//   CMP_FIELD (constraint_set0_flag);
+//   CMP_FIELD (constraint_set1_flag);
+//   CMP_FIELD (constraint_set2_flag);
+//   CMP_FIELD (constraint_set3_flag);
+//   CMP_FIELD (constraint_set4_flag);
+//   CMP_FIELD (constraint_set5_flag);
+//   CMP_FIELD (level_idc);
+
+//   CMP_FIELD (chroma_format_idc);
+//   CMP_FIELD (separate_colour_plane_flag);
+//   CMP_FIELD (bit_depth_luma_minus8);
+//   CMP_FIELD (bit_depth_chroma_minus8);
+//   CMP_FIELD (qpprime_y_zero_transform_bypass_flag);
+
+//   CMP_FIELD (scaling_matrix_present_flag);
+//   //guint8 scaling_lists_4x4[6][16];
+//   //guint8 scaling_lists_8x8[6][64];
+
+//   CMP_FIELD (log2_max_frame_num_minus4);
+//   CMP_FIELD (pic_order_cnt_type);
+
+//   CMP_FIELD (log2_max_pic_order_cnt_lsb_minus4);
+
+//   CMP_FIELD (delta_pic_order_always_zero_flag);
+//   CMP_FIELD (offset_for_non_ref_pic);
+//   CMP_FIELD (offset_for_top_to_bottom_field);
+//   CMP_FIELD (num_ref_frames_in_pic_order_cnt_cycle);
+//   //gint32 offset_for_ref_frame[255];
+
+//   CMP_FIELD (num_ref_frames);
+//   CMP_FIELD (gaps_in_frame_num_value_allowed_flag);
+//   CMP_FIELD (pic_width_in_mbs_minus1);
+//   CMP_FIELD (pic_height_in_map_units_minus1);
+//   CMP_FIELD (frame_mbs_only_flag);
+
+//   CMP_FIELD (mb_adaptive_frame_field_flag);
+
+//   CMP_FIELD (direct_8x8_inference_flag);
+
+//   CMP_FIELD (frame_cropping_flag);
+
+//   CMP_FIELD (frame_crop_left_offset);
+//   CMP_FIELD (frame_crop_right_offset);
+//   CMP_FIELD (frame_crop_top_offset);
+//   CMP_FIELD (frame_crop_bottom_offset);
+
+//   CMP_FIELD (vui_parameters_present_flag);
+//   //GstH264VUIParams vui_parameters;
+
+//   CMP_FIELD (chroma_array_type);
+//   CMP_FIELD (max_frame_num);
+//   CMP_FIELD (width);
+//   CMP_FIELD (height);
+//   CMP_FIELD (crop_rect_width);
+//   CMP_FIELD (crop_rect_height);
+//   CMP_FIELD (crop_rect_x);
+//   CMP_FIELD (crop_rect_y);
+//   CMP_FIELD (valid);
+
+//   CMP_FIELD (extension_type);
+//   //union {
+//   //  GstH264SPSExtMVC mvc;
+//   //} extension;
+
+//   return true;
+// #undef CMP_FIELD
+// }
+
+// static bool
+// pps_cmp (GstH264PPS * a, GstH264PPS * b)
+// {
+// #define CMP_FIELD(x)  G_STMT_START { if (a->x != b->x) return false;  }  G_STMT_END
+//   CMP_FIELD (id);
+
+//   //GstH264SPS *sequence;
+
+//   CMP_FIELD (entropy_coding_mode_flag);
+//   CMP_FIELD (pic_order_present_flag);
+
+//   CMP_FIELD (num_slice_groups_minus1);
+
+//   CMP_FIELD (slice_group_map_type);
+//   // guint32 run_length_minus1[8];
+//   // guint32 top_left[8];
+//   // guint32 bottom_right[8];
+//   CMP_FIELD (slice_group_change_direction_flag);
+//   CMP_FIELD (slice_group_change_rate_minus1);
+//   CMP_FIELD (pic_size_in_map_units_minus1);
+//   // guint8 *slice_group_id;
+
+//   CMP_FIELD (num_ref_idx_l0_active_minus1);
+//   CMP_FIELD (num_ref_idx_l1_active_minus1);
+//   CMP_FIELD (weighted_pred_flag);
+//   CMP_FIELD (weighted_bipred_idc);
+//   CMP_FIELD (pic_init_qp_minus26);
+//   CMP_FIELD (pic_init_qs_minus26);
+//   CMP_FIELD (chroma_qp_index_offset);
+//   CMP_FIELD (deblocking_filter_control_present_flag);
+//   CMP_FIELD (constrained_intra_pred_flag);
+//   CMP_FIELD (redundant_pic_cnt_present_flag);
+
+//   CMP_FIELD (transform_8x8_mode_flag);
+
+//   // guint8 scaling_lists_4x4[6][16];
+//   // guint8 scaling_lists_8x8[6][64];
+
+//   CMP_FIELD (second_chroma_qp_index_offset);
+//   CMP_FIELD (valid);
+
+//   CMP_FIELD (pic_scaling_matrix_present_flag);
+
+//   return true;
+// #undef CMP_FIELD
+// }
+
+// static void
+// gst_vk_h264_dec_update_picture_parameters (GstH264Decoder * decoder,
+//     GstH264NalUnitType type, const gpointer nalu)
+// {
+//   GstVkH264Dec *self = GST_VK_H264_DEC (decoder);
+//   VkPictureParameters params;
+
+//   switch (type) {
+//     case GST_H264_NAL_SPS:{
+//       GstH264SPS *sps = static_cast < GstH264SPS * >(nalu);
+//       if (sps_cmp (&self->last_sps, sps))
+//         return;
+//       self->last_sps = *sps;
+//       fill_sps (sps, &self->vkp);
+//       params = VkPictureParameters {
+//         .updateType = VK_PICTURE_PARAMETERS_UPDATE_H264_SPS,
+//         .pH264Sps = &self->vkp.sps,
+//         .updateSequenceCount = self->sps_update_count++,
+//       };
+//       if (self->client) {
+//         if (!self->client->UpdatePictureParameters (&params, self->spsclient,
+//                 params.updateSequenceCount))
+//           GST_ERROR_OBJECT (self, "Failed to update sequence parameters");
+//       }
+//       break;
+//     }
+//     case GST_H264_NAL_PPS:{
+//       GstH264PPS *pps = static_cast < GstH264PPS * >(nalu);
+//       if (pps_cmp (&self->last_pps, pps))
+//         return;
+//       self->last_pps = *pps;
+//       fill_pps (pps, &self->vkp);
+//       params = VkPictureParameters {
+//         .updateType = VK_PICTURE_PARAMETERS_UPDATE_H264_PPS,
+//         .pH264Pps = &self->vkp.pps,
+//         .updateSequenceCount = self->pps_update_count++,
+//       };
+//       if (self->client) {
+//         if (!self->client->UpdatePictureParameters (&params, self->ppsclient,
+//                 params.updateSequenceCount))
+//           GST_ERROR_OBJECT (self, "Failed to update picture parameters");
+//       }
+//       break;
+//     }
+//     default:
+//       break;
+//   }
+// }
+
+GstVkH264Parser::GstVkH264Parser(VkParserVideoDecodeClient* client):
+m_client(client)
+{
+    m_parser = gst_h264_nal_parser_new();
+}
+
+GstVkH264Parser::~GstVkH264Parser()
+{
+    gst_h264_nal_parser_free(m_parser);
+}
+
+GstFlowReturn GstVkH264Parser::parseSPS(GstH264NalUnit * nalu)
+{
+  GstH264SPS sps;
+  GstH264ParserResult pres;
+  GstFlowReturn ret = GST_FLOW_OK;
+
+  pres = gst_h264_parse_sps (nalu, &sps);
+  if (pres != GST_H264_PARSER_OK) {
+    GST_WARNING ("Failed to parse SPS, result %d", pres);
+    return GST_FLOW_ERROR;
+  }
+
+  if (gst_h264_parser_update_sps (m_parser,
+          &sps) != GST_H264_PARSER_OK) {
+    GST_WARNING("Failed to update SPS");
+    ret = GST_FLOW_ERROR;
+  }
+  
+
+  gst_h264_sps_clear (&sps);
+
+  return ret;
+}
+
+GstFlowReturn GstVkH264Parser::parsePPS(GstH264NalUnit * nalu)
+{
+  GstH264PPS pps;
+  GstH264ParserResult pres;
+  GstFlowReturn ret = GST_FLOW_OK;
+
+  pres = gst_h264_parse_pps (m_parser, nalu, &pps);
+  if (pres != GST_H264_PARSER_OK) {
+    GST_WARNING ("Failed to parse PPS, result %d", pres);
+    return GST_FLOW_ERROR;
+  }
+  
+  if (gst_h264_parser_update_pps (m_parser, &pps)
+      != GST_H264_PARSER_OK) {
+    GST_WARNING ("Failed to update PPS");
+    ret = GST_FLOW_ERROR;
+  }
+
+  gst_h264_pps_clear (&pps);
+
+  return ret;
+}
+
+GstFlowReturn GstVkH264Parser::parseSlice(GstH264NalUnit * nalu)
+{
+  GstFlowReturn ret = GST_FLOW_OK;
+
+  return ret;
+}
+
+
+GstFlowReturn GstVkH264Parser::identifyNalu(GstH264NalUnit* nalu) 
+{
+    GstFlowReturn ret = GST_FLOW_OK;
+
+  GST_LOG ("Parsed nal type: %d, offset %d, size %d",
+      nalu->type, nalu->offset, nalu->size);
+
+  switch (nalu->type) {
+    case GST_H264_NAL_SPS:
+      ret = parseSPS (nalu);
+      break;
+    case GST_H264_NAL_PPS:
+      ret = parsePPS (nalu);
+      break;
+    case GST_H264_NAL_SLICE:
+    case GST_H264_NAL_SLICE_DPA:
+    case GST_H264_NAL_SLICE_DPB:
+    case GST_H264_NAL_SLICE_DPC:
+    case GST_H264_NAL_SLICE_IDR:
+    case GST_H264_NAL_SLICE_EXT:
+      ret = parseSlice (nalu);
+      break;
+    default:
+      break;
+  }
+
+  return ret;
+}
+
+GstFlowReturn GstVkH264Parser::parse(GstBuffer* buffer)
+{
+    GstH264ParserResult pres;
+    GstH264NalUnit nalu;
+    GstMapInfo map;
+    GstFlowReturn decode_ret = GST_FLOW_OK;
+
+    gst_buffer_map(buffer, &map, GST_MAP_READ);
+    //
+    pres = gst_h264_parser_identify_nalu_avc(m_parser, map.data, 0, map.size, 4, &nalu);
+    while (pres == GST_H264_PARSER_OK && decode_ret == GST_FLOW_OK) {
+      decode_ret = identifyNalu (&nalu);
+
+      pres = gst_h264_parser_identify_nalu_avc (m_parser,
+          map.data, nalu.offset + nalu.size, map.size, 4,
+          &nalu);
+    }
+
+    GST_ERROR("res= %d", decode_ret);
+    
+    return decode_ret;
+}

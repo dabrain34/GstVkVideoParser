@@ -18,34 +18,12 @@
 #pragma once
 
 #include <gst/gst.h>
-#include <gst/check/gstharness.h>
-#define VK_ENABLE_BETA_EXTENSIONS 1
-#include <vulkan/vulkan.h>
-#include "gstvkparse.h"
-
 G_BEGIN_DECLS
 
-class GstVkVideoParser {
+class GstVkParser {
 public:
-    GstVkVideoParser(gpointer user_data,
-                                       VkVideoCodecOperationFlagBitsKHR codec,
-                                       gboolean oob_pic_params);
-    ~GstVkVideoParser();
-
-    bool build();
-    void dispose ();
-    GstFlowReturn pushBuffer(GstBuffer *buffer);
-    void processMessages ();
-    GstFlowReturn eos();
-    void parseBuffer(GstBuffer * buffer);
-
-private:
-    void* m_client;
-    VkVideoCodecOperationFlagBitsKHR m_codec;
-    bool m_oob_pic_params;
-    GstHarness* m_harness;
-    GstBus* m_bus;
-    GstVkParser* m_parser;
+    virtual ~GstVkParser() = default;
+    virtual GstFlowReturn parse(GstBuffer* buffer) = 0;
 };
 
 G_END_DECLS
