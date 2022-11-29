@@ -13,7 +13,7 @@ demuxeres = shared_library(
   c_args: ['-DGST_USE_UNSTABLE_API','-DBUILDING_DEMUXERES'],
   install: true,
 #  vs_module_defs: 'gstdemuxeres.def',
-  dependencies: [gst_dep, gst_codecparsers_dep, gst_video_dep, gstapp_dep],
+  dependencies: [gst_dep, gst_codecparsers_dep, gst_video_dep, gst_audio_dep, gstapp_dep],
 )
 
 libdemuxeres_dep = declare_dependency(
