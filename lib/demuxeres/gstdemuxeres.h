@@ -125,8 +125,13 @@ typedef struct
 #define DEMUXER_ES_DEFAULT_MAX_QUEUE_SIZE 100
 #define DEMUXER_ES_DEFAULT_THRESHOLD_QUEUE_SIZE 10
 
+typedef gsize (*asyncReadDemuxerESFunc)(guint8 ** data, gsize size);
+
 GST_DEMUXER_ES_API
 GstDemuxerES * gst_demuxer_es_new (const gchar * uri);
+
+GST_DEMUXER_ES_API
+GstDemuxerES * gst_demuxer_es_new_async (asyncReadDemuxerESFunc read_packet);
 
 GST_DEMUXER_ES_API
 GstDemuxerESResult gst_demuxer_es_read_packet (GstDemuxerES * demuxer, GstDemuxerESPacket ** packet);

@@ -57,6 +57,8 @@ struct _GstDemuxerESPrivate
   GMutex queue_mutex;
   gint max_queue_size;
   gint threshold_queue_size;
+
+    gsize (*async_read_func) (guint8 ** data, gsize size);
 };
 
 #define GST_QUEUE_SIGNAL_DEL(q) G_STMT_START {                          \
@@ -113,12 +115,12 @@ set_demuxer_ready (GstDemuxerES * demuxer)
 }
 
 static GstFlowReturn
-appsink_new_sample_cb (GstAppSink * appsink, gpointer  user_data)
+appsink_new_sample_cb (GstAppSink * appsink, gpointer user_data)
 {
   GstSample *sample;
   GstBuffer *buffer;
   GstDemuxerEStream *stream = user_data;
-  GstDemuxerES * demuxer = stream->demuxer;
+  GstDemuxerES *demuxer = stream->demuxer;
   GstDemuxerESPrivate *priv = demuxer->priv;
 
   sample = gst_app_sink_pull_sample (appsink);
@@ -273,8 +275,8 @@ gst_parse_stream_create (GstDemuxerES * demuxer, GstPad * pad)
   switch (stream->type) {
     case DEMUXER_ES_STREAM_TYPE_VIDEO:
     {
-      gst_video_info_from_caps(&stream->data.video.info, caps);
-     gst_structure_get_int (s, "bitrate", &stream->data.video.bitrate);
+      gst_video_info_from_caps (&stream->data.video.info, caps);
+      gst_structure_get_int (s, "bitrate", &stream->data.video.bitrate);
       stream->data.video.profile =
           g_strdup (gst_structure_get_string (s, "profile"));
       stream->data.video.level =
@@ -284,7 +286,7 @@ gst_parse_stream_create (GstDemuxerES * demuxer, GstPad * pad)
     }
     case DEMUXER_ES_STREAM_TYPE_AUDIO:
     {
-      gst_audio_info_from_caps(&stream->data.audio.info, caps);
+      gst_audio_info_from_caps (&stream->data.audio.info, caps);
       gst_structure_get_int (s, "bitrate", &stream->data.audio.bitrate);
       stream->data.audio.acodec = gst_parse_stream_get_acodec_from_caps (caps);
       break;
@@ -302,7 +304,7 @@ gst_parse_stream_create (GstDemuxerES * demuxer, GstPad * pad)
   if ((link = gst_pad_link (pad, sinkpad)) != GST_PAD_LINK_OK) {
     GST_ERROR ("Unable to link the appsink with the parser link status %d",
         link);
-    gst_parse_stream_teardown(stream);
+    gst_parse_stream_teardown (stream);
     stream = NULL;
   }
 
@@ -312,9 +314,8 @@ gst_parse_stream_create (GstDemuxerES * demuxer, GstPad * pad)
   if (appsink)
     gst_element_sync_state_with_parent (appsink);
 
-  callbacks.new_sample =appsink_new_sample_cb;
-  gst_app_sink_set_callbacks ((GstAppSink *) appsink, &callbacks, stream,
-      NULL);
+  callbacks.new_sample = appsink_new_sample_cb;
+  gst_app_sink_set_callbacks ((GstAppSink *) appsink, &callbacks, stream, NULL);
 
   gst_caps_unref (caps);
   gst_object_unref (sinkpad);
@@ -488,13 +489,11 @@ check_for_bus_message (GstDemuxerES * demuxer)
   return terminate;
 }
 
-GstDemuxerES *
-gst_demuxer_es_new (const gchar * uri)
+static GstDemuxerES *
+_gst_demuxer_es_new_pre ()
 {
   GstDemuxerES *demuxer;
   GstDemuxerESPrivate *priv;
-  GstElement *uridecodebin;
-  GstStateChangeReturn sret;
 
   if (!gst_init_check (NULL, NULL, NULL))
     return NULL;
@@ -513,26 +512,18 @@ gst_demuxer_es_new (const gchar * uri)
   priv->max_queue_size = DEMUXER_ES_DEFAULT_MAX_QUEUE_SIZE;
   priv->threshold_queue_size = DEMUXER_ES_DEFAULT_THRESHOLD_QUEUE_SIZE;
 
-  priv->current_uri = get_gst_valid_uri(uri);
-
   priv->packets = g_async_queue_new_full ((GDestroyNotify) g_free);
 
   priv->pipeline = gst_pipeline_new ("demuxeres");
 
-  uridecodebin = gst_element_factory_make ("uridecodebin", NULL);
-  g_object_set (G_OBJECT (uridecodebin), "uri", priv->current_uri, NULL);
+  return demuxer;
+}
 
-  g_signal_connect (uridecodebin, "pad-added",
-      G_CALLBACK (uridecodebin_pad_added_cb), demuxer);
-  g_signal_connect (uridecodebin, "no-more-pads",
-      G_CALLBACK (uridecodebin_pad_no_more_pads), demuxer);
-  g_signal_connect (uridecodebin, "autoplug-select",
-      G_CALLBACK (uridecodebin_autoplug_select_cb), demuxer);
-  g_signal_connect (uridecodebin, "autoplug-query",
-      G_CALLBACK (uridecodebin_autoplug_query_cb), demuxer);
-
-  gst_bin_add_many (GST_BIN (priv->pipeline), uridecodebin, NULL);
-
+static GstDemuxerES *
+_gst_demuxer_es_new_post (GstDemuxerES * demuxer)
+{
+  GstStateChangeReturn sret;
+  GstDemuxerESPrivate *priv = demuxer->priv;
   sret = gst_element_set_state (priv->pipeline, GST_STATE_PLAYING);
   switch (sret) {
     case GST_STATE_CHANGE_FAILURE:
@@ -557,7 +548,95 @@ gst_demuxer_es_new (const gchar * uri)
     gst_demuxer_es_teardown (demuxer);
     demuxer = NULL;
   }
+
   return demuxer;
+}
+
+
+GstDemuxerES *
+gst_demuxer_es_new (const gchar * uri)
+{
+  GstDemuxerES *demuxer;
+  GstDemuxerESPrivate *priv;
+  GstElement *uridecodebin;
+
+
+  demuxer = _gst_demuxer_es_new_pre ();
+  if (!demuxer)
+    return NULL;
+  priv = demuxer->priv;
+
+  priv->current_uri = get_gst_valid_uri (uri);
+
+  uridecodebin = gst_element_factory_make ("uridecodebin", NULL);
+  g_object_set (G_OBJECT (uridecodebin), "uri", priv->current_uri, NULL);
+
+  g_signal_connect (uridecodebin, "pad-added",
+      G_CALLBACK (uridecodebin_pad_added_cb), demuxer);
+  g_signal_connect (uridecodebin, "no-more-pads",
+      G_CALLBACK (uridecodebin_pad_no_more_pads), demuxer);
+  g_signal_connect (uridecodebin, "autoplug-select",
+      G_CALLBACK (uridecodebin_autoplug_select_cb), demuxer);
+  g_signal_connect (uridecodebin, "autoplug-query",
+      G_CALLBACK (uridecodebin_autoplug_query_cb), demuxer);
+
+  gst_bin_add_many (GST_BIN (priv->pipeline), uridecodebin, NULL);
+
+  return _gst_demuxer_es_new_post (demuxer);
+}
+
+static void
+feed_data (GstElement * appsrc, guint size, GstDemuxerES * demuxer)
+{
+  GstBuffer *buffer;
+  GstFlowReturn ret;
+  guint8 *data;
+  gsize data_size;
+
+  data_size = demuxer->priv->async_read_func (&data, size);
+  if (data_size == 0) {
+    /* we are EOS, send end-of-stream */
+    g_signal_emit_by_name (appsrc, "end-of-stream", &ret);
+    return;
+  }
+  buffer = gst_buffer_new ();
+  gst_buffer_append_memory (buffer,
+      gst_memory_new_wrapped (GST_MEMORY_FLAG_READONLY,
+          data, data_size, 0, data_size, NULL, NULL));
+  g_signal_emit_by_name (appsrc, "push-buffer", buffer, &ret);
+  gst_buffer_unref (buffer);
+}
+
+GstDemuxerES *
+gst_demuxer_es_new_async (asyncReadDemuxerESFunc read_packet)
+{
+  GstDemuxerES *demuxer;
+  GstDemuxerESPrivate *priv;
+  GstElement *appsrc, *decodebin;
+  demuxer = _gst_demuxer_es_new_pre ();
+  if (!demuxer)
+    return NULL;
+  priv = demuxer->priv;
+
+  priv->async_read_func = read_packet;
+  appsrc = gst_element_factory_make ("appsrc", NULL);
+  decodebin = gst_element_factory_make ("decodebin", NULL);
+
+  g_signal_connect (appsrc, "need-data", G_CALLBACK (feed_data), demuxer);
+
+  g_signal_connect (decodebin, "pad-added",
+      G_CALLBACK (uridecodebin_pad_added_cb), demuxer);
+  g_signal_connect (decodebin, "no-more-pads",
+      G_CALLBACK (uridecodebin_pad_no_more_pads), demuxer);
+  g_signal_connect (decodebin, "autoplug-select",
+      G_CALLBACK (uridecodebin_autoplug_select_cb), demuxer);
+  g_signal_connect (decodebin, "autoplug-query",
+      G_CALLBACK (uridecodebin_autoplug_query_cb), demuxer);
+
+  gst_bin_add_many (GST_BIN (priv->pipeline), appsrc, decodebin, NULL);
+  gst_element_link_many (appsrc, decodebin, NULL);
+
+  return _gst_demuxer_es_new_post (demuxer);
 }
 
 void
@@ -565,11 +644,12 @@ gst_demuxer_es_clear_packet (GstDemuxerESPacket * packet)
 {
   gst_sample_unref (packet->priv->sample);
   g_free (packet->priv);
-  g_free(packet);
+  g_free (packet);
 }
 
 GstDemuxerESResult
-gst_demuxer_es_read_packet (GstDemuxerES * demuxer, GstDemuxerESPacket ** packet)
+gst_demuxer_es_read_packet (GstDemuxerES * demuxer,
+    GstDemuxerESPacket ** packet)
 {
   GstDemuxerESPacket *queued_packet;
 
@@ -591,8 +671,9 @@ gst_demuxer_es_read_packet (GstDemuxerES * demuxer, GstDemuxerESPacket ** packet
   if (queued_packet) {
     *packet = queued_packet;
     result = DEMUXER_ES_RESULT_NEW_PACKET;
-    if (priv->state == DEMUXER_ES_STATE_EOS && g_async_queue_length(priv->packets) == 0) {
-      result =  DEMUXER_ES_RESULT_LAST_PACKET;
+    if (priv->state == DEMUXER_ES_STATE_EOS
+        && g_async_queue_length (priv->packets) == 0) {
+      result = DEMUXER_ES_RESULT_LAST_PACKET;
     }
   } else {
     if (priv->state == DEMUXER_ES_STATE_EOS)
