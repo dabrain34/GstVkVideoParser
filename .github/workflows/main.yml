@@ -35,6 +35,17 @@ jobs:
           # Hack to install libunwind-dev (gstreamer dependency)
           sudo apt remove --assume-yes libunwind-14-dev
           sudo apt install --assume-yes --no-install-recommends meson libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-bad valgrind
+          sudo apt install ubuntu-dbgsym-keyring
+          wget -O - http://ddebs.ubuntu.com/dbgsym-release-key.asc | sudo apt-key add -
+
+      - name: Add debug repos on ubuntu
+        run:  |
+           echo "deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ddebs.list
+           echo "deb http://ddebs.ubuntu.com $(lsb_release -cs)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ddebs.list
+           echo "deb http://ddebs.ubuntu.com $(lsb_release -cs)-proposed main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ddebs.list
+           sudo apt-get update
+           sudo apt install --assume-yes --no-install-recommends libgstreamer1.0-dev-dbgsym libgstreamer-plugins-base1.0-0-dbgsym libgstreamer-plugins-base1.0-0-dbgsym gstreamer1.0-plugins-bad-dbgsym
+          # the key expired and the ubuntu-dbgsym-keyring package does not yet include the latest one - see https://bugs.launchpad.net/ubuntu/+source/ubuntu-keyring/+bug/1920640
 
       - name: Configure
         run: meson setup builddir
